@@ -20,11 +20,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ConversationHandler, ContextTypes, filters
 from telegram.constants import ParseMode
 
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-import undetected_chromedriver as uc
+from patchright.async_api import async_playwright, Page, Browser
 
 import config
 
@@ -1967,12 +1963,14 @@ async def start_token_extraction_callback(update: Update, context: ContextTypes.
     )
 
     try:
-        # Initialize undetected Chrome driver
-        options = uc.ChromeOptions()
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
+        # Initialize patchright
+        p = await async_playwright().start()
+        browser = await p.chromium.launch(headless=True) # Patchright is undetectable even in headless mode
+        context.user_data['playwright_instance'] = p
+        context.user_data['discord_browser'] = browser
 
-        driver = uc.Chrome(options=options)
+        page = await browser.new_page()
+        context.user_data['discord_page'] = page
 
         # Step 1: Navigate to Discord login
         await query.edit_message_text(
@@ -1981,15 +1979,13 @@ async def start_token_extraction_callback(update: Update, context: ContextTypes.
             parse_mode=ParseMode.MARKDOWN
         )
 
-        driver.get("https://discord.com/login")
+        await page.goto("https://discord.com/login")
 
         # Wait for page to load
-        WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.TAG_NAME, "body"))
-        )
+        await page.wait_for_load_state("networkidle")
 
-        # Wait 1 second as requested
-        time.sleep(1)
+        # Wait 1 second
+        await asyncio.sleep(1)
 
         # Step 2: Take screenshot of QR code
         await query.edit_message_text(
@@ -2000,14 +1996,16 @@ async def start_token_extraction_callback(update: Update, context: ContextTypes.
 
         try:
             # Wait for QR code container to appear
-            qr_element = WebDriverWait(driver, 10).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, ".qrCodeContainer_c28498.qrCode_e16417"))
-            )
+            qr_selector = ".qrCodeContainer_c28498.qrCode_e16417"
+            qr_element = await page.wait_for_selector(qr_selector, timeout=10000)
 
-            # Take screenshot of the QR code element using BytesIO
-            screenshot_bytes = qr_element.screenshot_as_png
+            if not qr_element:
+                raise Exception("QR code element not found")
+
+            # Take screenshot of the QR code element
+            screenshot_bytes = await qr_element.screenshot()
             photo_buffer = BytesIO(screenshot_bytes)
-            photo_buffer.name = "discord_qr.png"  # Set filename for Telegram
+            photo_buffer.name = "discord_qr.png"
 
             # Send the screenshot
             keyboard = [
@@ -2025,12 +2023,13 @@ async def start_token_extraction_callback(update: Update, context: ContextTypes.
                 parse_mode=ParseMode.MARKDOWN
             )
 
-            # Store driver in context for later use
-            context.user_data['discord_driver'] = driver
-
         except Exception as e:
             logger.error(f"Failed to find QR code: {e}")
-            driver.quit()
+            await browser.close()
+            await p.stop()
+            context.user_data.pop('playwright_instance', None)
+            context.user_data.pop('discord_browser', None)
+            context.user_data.pop('discord_page', None)
             await query.edit_message_text(
                 "❌ **QR Code Not Found**\n\n"
                 "Could not locate the Discord QR code.\n"
@@ -2044,6 +2043,13 @@ async def start_token_extraction_callback(update: Update, context: ContextTypes.
 
     except Exception as e:
         logger.error(f"Failed to start token extraction: {e}")
+        if 'discord_browser' in context.user_data:
+            await context.user_data['discord_browser'].close()
+        if 'playwright_instance' in context.user_data:
+            await context.user_data['playwright_instance'].stop()
+        context.user_data.pop('playwright_instance', None)
+        context.user_data.pop('discord_browser', None)
+        context.user_data.pop('discord_page', None)
         await query.edit_message_text(
             "❌ **Browser Initialization Failed**\n\n"
             f"Error: {str(e)}\n\n"
@@ -2060,8 +2066,8 @@ async def rescreenshot_qr_callback(update: Update, context: ContextTypes.DEFAULT
     await query.answer()
 
     try:
-        driver = context.user_data.get('discord_driver')
-        if not driver:
+        page = context.user_data.get('discord_page')
+        if not page:
             await query.edit_message_caption(
                 caption="❌ **Error**\n\nBrowser session lost. Please start over.",
                 parse_mode=ParseMode.MARKDOWN
@@ -2076,12 +2082,14 @@ async def rescreenshot_qr_callback(update: Update, context: ContextTypes.DEFAULT
 
         try:
             # Find QR code container again
-            qr_element = WebDriverWait(driver, 10).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, ".qrCodeContainer_c28498.qrCode_e16417"))
-            )
+            qr_selector = ".qrCodeContainer_c28498.qrCode_e16417"
+            qr_element = await page.wait_for_selector(qr_selector, timeout=10000)
 
-            # Take new screenshot using BytesIO
-            screenshot_bytes = qr_element.screenshot_as_png
+            if not qr_element:
+                raise Exception("QR code element not found")
+
+            # Take new screenshot
+            screenshot_bytes = await qr_element.screenshot()
             photo_buffer = BytesIO(screenshot_bytes)
             photo_buffer.name = "discord_qr.png"
 
@@ -2151,8 +2159,8 @@ async def qr_scanned_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         context.user_data['progress_message'] = progress_message
 
     try:
-        driver = context.user_data.get('discord_driver')
-        if not driver:
+        page = context.user_data.get('discord_page')
+        if not page:
             await query.edit_message_text(
                 "❌ **Error**\n\nBrowser session lost. Please start over.",
                 parse_mode=ParseMode.MARKDOWN
@@ -2165,11 +2173,19 @@ async def qr_scanned_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             js_script = f.read()
 
         # Execute the JavaScript to get the token
-        token = driver.execute_script(js_script)
+        token = await page.evaluate(js_script)
 
         # Clean up the browser
-        driver.quit()
-        context.user_data.pop('discord_driver', None)
+        browser = context.user_data.get('discord_browser')
+        p = context.user_data.get('playwright_instance')
+        if browser:
+            await browser.close()
+        if p:
+            await p.stop()
+
+        context.user_data.pop('playwright_instance', None)
+        context.user_data.pop('discord_browser', None)
+        context.user_data.pop('discord_page', None)
 
         if token:
             keyboard = [
@@ -2248,11 +2264,16 @@ async def qr_scanned_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception as e:
         logger.error(f"Failed to extract token: {e}")
 
-        # Clean up driver if it exists
-        driver = context.user_data.get('discord_driver')
-        if driver:
-            driver.quit()
-            context.user_data.pop('discord_driver', None)
+        # Clean up browser if it exists
+        browser = context.user_data.get('discord_browser')
+        p = context.user_data.get('playwright_instance')
+        if browser:
+            await browser.close()
+        if p:
+            await p.stop()
+        context.user_data.pop('playwright_instance', None)
+        context.user_data.pop('discord_browser', None)
+        context.user_data.pop('discord_page', None)
 
         error_text = (
             f"❌ **Token Extraction Failed**\n\n"
@@ -2289,11 +2310,16 @@ async def cancel_token_extraction_callback(update: Update, context: ContextTypes
     query = update.callback_query
     await query.answer()
 
-    # Clean up driver if it exists
-    driver = context.user_data.get('discord_driver')
-    if driver:
-        driver.quit()
-        context.user_data.pop('discord_driver', None)
+    # Clean up browser if it exists
+    browser = context.user_data.get('discord_browser')
+    p = context.user_data.get('playwright_instance')
+    if browser:
+        await browser.close()
+    if p:
+        await p.stop()
+    context.user_data.pop('playwright_instance', None)
+    context.user_data.pop('discord_browser', None)
+    context.user_data.pop('discord_page', None)
 
     keyboard = [
         [InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")]
