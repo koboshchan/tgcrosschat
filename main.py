@@ -31,7 +31,7 @@ def create_header(bot, auth_token):
             'User-Agent': bot.http.user_agent,
             'X-Discord-Locale': 'en-US',
             'X-Debug-Options': 'bugReporterEnabled',
-            'X-Super-Properties': bot.http.encoded_super_properties,
+            'X-Super-Properties': bot.http.headers.encoded_super_properties,
             'Authorization': auth_token
     }
     return headers
