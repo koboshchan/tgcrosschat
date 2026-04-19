@@ -460,8 +460,8 @@ class MessageBridge:
         if update.message.chat_id != TOPICS_CHANNEL_ID:
             return
 
-        # Don't forward bot's own messages
-        if update.message.from_user.is_bot:
+        # Don't forward bot's own messages; skip anonymous/channel messages with no sender
+        if not update.message.from_user or update.message.from_user.is_bot:
             return
 
         topic_id = update.message.message_thread_id
@@ -1227,8 +1227,12 @@ def run_telegram_bot():
     )
     telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.PHOTO & ~filters.REPLY, handle_telegram_message))
     telegram_app.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND & ~filters.REPLY, handle_telegram_message))
+    telegram_app.add_handler(MessageHandler(filters.Document.ALL & ~filters.COMMAND & ~filters.REPLY, handle_telegram_message))
+    telegram_app.add_handler(MessageHandler(filters.VIDEO & ~filters.COMMAND & ~filters.REPLY, handle_telegram_message))
     telegram_app.add_handler(MessageHandler(filters.REPLY & ~filters.COMMAND & ~filters.PHOTO, handle_telegram_message))
     telegram_app.add_handler(MessageHandler(filters.REPLY & filters.PHOTO & ~filters.COMMAND, handle_telegram_message))
+    telegram_app.add_handler(MessageHandler(filters.REPLY & filters.Document.ALL & ~filters.COMMAND, handle_telegram_message))
+    telegram_app.add_handler(MessageHandler(filters.REPLY & filters.VIDEO & ~filters.COMMAND, handle_telegram_message))
     telegram_app.add_handler(edit_handler)
 
     # Start Telegram bot
