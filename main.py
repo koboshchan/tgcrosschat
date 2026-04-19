@@ -21,7 +21,7 @@ def create_header(bot, auth_token):
             'Pragma': 'no-cache',
             'Referer': 'https://discord.com/channels/@me',
             'Sec-CH-UA': '"Google Chrome";v="{0}", "Chromium";v="{0}", ";Not A Brand";v="99"'.format(
-                bot.http.browser_version.split('.')[0]
+                str(bot.http.browser_version).split('.')[0]
             ),
             'Sec-CH-UA-Mobile': '?0',
             'Sec-CH-UA-Platform': '"Windows"',
