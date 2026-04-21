@@ -560,7 +560,7 @@ class MessageBridge:
 
             if response.status_code == 200:
                 discord_msg_data = response.json()
-                discord_msg_id = discord_msg_data["id"]
+                discord_msg_id = int(discord_msg_data["id"])
 
                 # Store message mapping
                 message_doc = {
@@ -758,7 +758,7 @@ class MessageBridge:
 
             if response.status_code == 200:
                 discord_msg_data = response.json()
-                discord_msg_id = discord_msg_data["id"]
+                discord_msg_id = int(discord_msg_data["id"])
 
                 # Store message mapping
                 message_doc = {
