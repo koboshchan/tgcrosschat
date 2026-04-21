@@ -1,3 +1,4 @@
+import io
 import logging
 import os
 import discord
@@ -56,6 +57,8 @@ TOPICS_CHANNEL_ID = int(os.getenv('TOPICS_CHANNEL_ID'))
 
 if not DISCORD_TOKEN or not TELEGRAM_BOT_TOKEN or not TOPICS_CHANNEL_ID:
     raise ValueError("Missing required environment variables. Check your .env file.")
+
+MAX_ATTACHMENT_SIZE = 5 * 1024 * 1024  # 5 MB
 
 # MongoDB connection (using Docker DNS)
 mongo_client = MongoClient('mongodb://mongo:27017/')
@@ -211,20 +214,32 @@ class MessageBridge:
             # Handle attachments
             for attachment in message.attachments:
                 try:
-                    if attachment.content_type and attachment.content_type.startswith("image/"):
-                        telegram_attachment = await self.telegram_bot.send_photo(
+                    if attachment.size > MAX_ATTACHMENT_SIZE:
+                        # File too large to re-upload; send as a link
+                        telegram_attachment = await self.telegram_bot.send_message(
                             chat_id=TOPICS_CHANNEL_ID,
                             message_thread_id=topic_id,
-                            photo=attachment.url,
-                            caption=f"Image from {user_display_name}"
+                            text=f"📎 {attachment.filename} (from {user_display_name}): {attachment.url}"
                         )
                     else:
-                        telegram_attachment = await self.telegram_bot.send_document(
-                            chat_id=TOPICS_CHANNEL_ID,
-                            message_thread_id=topic_id,
-                            document=attachment.url,
-                            caption=f"File from {user_display_name}: {attachment.filename}"
-                        )
+                        # Download to BytesIO and re-upload
+                        file_response = requests.get(attachment.url)
+                        file_bio = io.BytesIO(file_response.content)
+                        file_bio.name = attachment.filename
+                        if attachment.content_type and attachment.content_type.startswith("image/"):
+                            telegram_attachment = await self.telegram_bot.send_photo(
+                                chat_id=TOPICS_CHANNEL_ID,
+                                message_thread_id=topic_id,
+                                photo=file_bio,
+                                caption=f"Image from {user_display_name}"
+                            )
+                        else:
+                            telegram_attachment = await self.telegram_bot.send_document(
+                                chat_id=TOPICS_CHANNEL_ID,
+                                message_thread_id=topic_id,
+                                document=file_bio,
+                                caption=f"File from {user_display_name}: {attachment.filename}"
+                            )
 
                     # Store attachment mapping
                     attachment_doc = {
@@ -309,20 +324,32 @@ class MessageBridge:
             # Handle attachments
             for attachment in message.attachments:
                 try:
-                    if attachment.content_type and attachment.content_type.startswith("image/"):
-                        telegram_attachment = await self.telegram_bot.send_photo(
+                    if attachment.size > MAX_ATTACHMENT_SIZE:
+                        # File too large to re-upload; send as a link
+                        telegram_attachment = await self.telegram_bot.send_message(
                             chat_id=TOPICS_CHANNEL_ID,
                             message_thread_id=topic_id,
-                            photo=attachment.url,
-                            caption=f"Image from {user_display_name}"
+                            text=f"📎 {attachment.filename} (from {user_display_name}): {attachment.url}"
                         )
                     else:
-                        telegram_attachment = await self.telegram_bot.send_document(
-                            chat_id=TOPICS_CHANNEL_ID,
-                            message_thread_id=topic_id,
-                            document=attachment.url,
-                            caption=f"File from {user_display_name}: {attachment.filename}"
-                        )
+                        # Download to BytesIO and re-upload
+                        file_response = requests.get(attachment.url)
+                        file_bio = io.BytesIO(file_response.content)
+                        file_bio.name = attachment.filename
+                        if attachment.content_type and attachment.content_type.startswith("image/"):
+                            telegram_attachment = await self.telegram_bot.send_photo(
+                                chat_id=TOPICS_CHANNEL_ID,
+                                message_thread_id=topic_id,
+                                photo=file_bio,
+                                caption=f"Image from {user_display_name}"
+                            )
+                        else:
+                            telegram_attachment = await self.telegram_bot.send_document(
+                                chat_id=TOPICS_CHANNEL_ID,
+                                message_thread_id=topic_id,
+                                document=file_bio,
+                                caption=f"File from {user_display_name}: {attachment.filename}"
+                            )
 
                     # Store attachment mapping
                     attachment_doc = {
@@ -519,27 +546,68 @@ class MessageBridge:
             # Handle different message types
             content = update.message.text or ""
 
-            # Handle images and documents - append URL to content like old.py
-            if len(update.message.photo) > 0:
-                # Get the largest photo using same method as old.py
-                file_url = (await update.message.photo[-1].get_file()).file_path
-                content = (content or "") + "\n" + file_url
+            # Handle images and documents
+            file_data = None
+            filename = None
+            if update.message.photo:
+                photo = update.message.photo[-1]
+                file_size = photo.file_size or 0
+                if file_size > MAX_ATTACHMENT_SIZE:
+                    tg_file = await photo.get_file()
+                    content = (content or "") + "\n" + tg_file.file_path
+                else:
+                    tg_file = await photo.get_file()
+                    file_data = bytes(await tg_file.download_as_bytearray())
+                    filename = f"photo_{photo.file_unique_id}.jpg"
 
             elif update.message.document:
                 doc = update.message.document
-                file_url = (await doc.get_file()).file_path
-                content = (content or "") + "\n" + file_url
+                file_size = doc.file_size or 0
+                if file_size > MAX_ATTACHMENT_SIZE:
+                    tg_file = await doc.get_file()
+                    content = (content or "") + "\n" + tg_file.file_path
+                else:
+                    tg_file = await doc.get_file()
+                    file_data = bytes(await tg_file.download_as_bytearray())
+                    filename = doc.file_name or f"document_{doc.file_unique_id}"
 
             elif update.message.video:
                 video = update.message.video
-                file_url = (await video.get_file()).file_path
-                content = (content or "") + "\n" + file_url
+                file_size = video.file_size or 0
+                if file_size > MAX_ATTACHMENT_SIZE:
+                    tg_file = await video.get_file()
+                    content = (content or "") + "\n" + tg_file.file_path
+                else:
+                    tg_file = await video.get_file()
+                    file_data = bytes(await tg_file.download_as_bytearray())
+                    filename = video.file_name or f"video_{video.file_unique_id}.mp4"
 
-            # Handle text messages
-            if not content:
+            if not content and not file_data:
                 content = "[Empty message]"
 
-            logger.info(f"Attempting to send text message to Discord user {discord_user_id}: '{content}'")
+            logger.info(f"Attempting to send message to Discord user {discord_user_id}: '{content}'")
+
+            if file_data:
+                # Upload file to Discord
+                discord_msg_id = await self._send_discord_file(
+                    discord_user_id, dm_channel_id, content, None, filename,
+                    message_reference, file_data
+                )
+                if discord_msg_id:
+                    message_doc = {
+                        "message_content": content,
+                        "discord_channel_id": discord_user_id,
+                        "discord_message_id": discord_msg_id,
+                        "telegram_channel_id": TOPICS_CHANNEL_ID,
+                        "telegram_topic_id": topic_id,
+                        "telegram_message_id": update.message.message_id,
+                        "direction": "telegram_to_discord",
+                        "timestamp": datetime.utcnow(),
+                        "is_reply": message_reference is not None,
+                        "reply_to_discord_id": message_reference["message_id"] if message_reference else None
+                    }
+                    messages_collection.insert_one(message_doc)
+                return
 
             # Prepare the request payload
             payload = {
@@ -590,18 +658,20 @@ class MessageBridge:
             import traceback
             logger.error(f"Full traceback:\n{traceback.format_exc()}")
 
-    async def _send_discord_file(self, discord_user_id: int, dm_channel_id: str, content: str, file_url: str, filename: str, message_reference: dict = None):
+    async def _send_discord_file(self, discord_user_id: int, dm_channel_id: str, content: str, file_url: str, filename: str, message_reference: dict = None, file_data: bytes = None):
         """Send file to Discord using multipart form data"""
         try:
-            # Download the file
-            file_response = requests.get(file_url)
-            if file_response.status_code != 200:
-                logger.error(f"Failed to download file from Telegram: {file_response.status_code}")
-                return
+            if file_data is None:
+                # Download the file
+                file_response = requests.get(file_url)
+                if file_response.status_code != 200:
+                    logger.error(f"Failed to download file from Telegram: {file_response.status_code}")
+                    return
+                file_data = file_response.content
 
             # Prepare multipart form data
             files = {
-                'files[0]': (filename, file_response.content)
+                'files[0]': (filename, file_data)
             }
 
             data = {
@@ -640,18 +710,20 @@ class MessageBridge:
         except Exception as e:
             logger.error(f"Failed to send file to Discord: {e}")
 
-    async def _send_discord_channel_file(self, discord_channel_id: int, content: str, file_url: str, filename: str, message_reference: dict = None):
+    async def _send_discord_channel_file(self, discord_channel_id: int, content: str, file_url: str, filename: str, message_reference: dict = None, file_data: bytes = None):
         """Send file to Discord channel using multipart form data"""
         try:
-            # Download the file
-            file_response = requests.get(file_url)
-            if file_response.status_code != 200:
-                logger.error(f"Failed to download file from Telegram: {file_response.status_code}")
-                return
+            if file_data is None:
+                # Download the file
+                file_response = requests.get(file_url)
+                if file_response.status_code != 200:
+                    logger.error(f"Failed to download file from Telegram: {file_response.status_code}")
+                    return
+                file_data = file_response.content
 
             # Prepare multipart form data
             files = {
-                'files[0]': (filename, file_response.content)
+                'files[0]': (filename, file_data)
             }
 
             data = {
@@ -715,29 +787,71 @@ class MessageBridge:
             # Handle different message types
             content = update.message.text or ""
 
-            # Send just the content without Telegram header
+            # Handle media for channels
+            file_data = None
+            filename = None
             full_content = content
 
-            # Handle media for channels - append URLs to content like old.py
             if update.message.photo:
-                # Get the largest photo using same method as old.py
-                file_url = (await update.message.photo[-1].get_file()).file_path
-                full_content = (full_content or "") + "\n" + file_url
+                photo = update.message.photo[-1]
+                file_size = photo.file_size or 0
+                if file_size > MAX_ATTACHMENT_SIZE:
+                    tg_file = await photo.get_file()
+                    full_content = (full_content or "") + "\n" + tg_file.file_path
+                else:
+                    tg_file = await photo.get_file()
+                    file_data = bytes(await tg_file.download_as_bytearray())
+                    filename = f"photo_{photo.file_unique_id}.jpg"
 
             elif update.message.document:
-                # Get document URL
-                file_url = (await update.message.document.get_file()).file_path
-                full_content = (full_content or "") + "\n" + file_url
+                doc = update.message.document
+                file_size = doc.file_size or 0
+                if file_size > MAX_ATTACHMENT_SIZE:
+                    tg_file = await doc.get_file()
+                    full_content = (full_content or "") + "\n" + tg_file.file_path
+                else:
+                    tg_file = await doc.get_file()
+                    file_data = bytes(await tg_file.download_as_bytearray())
+                    filename = doc.file_name or f"document_{doc.file_unique_id}"
 
             elif update.message.video:
-                # Get video URL
-                file_url = (await update.message.video.get_file()).file_path
-                full_content = (full_content or "") + "\n" + file_url
+                video = update.message.video
+                file_size = video.file_size or 0
+                if file_size > MAX_ATTACHMENT_SIZE:
+                    tg_file = await video.get_file()
+                    full_content = (full_content or "") + "\n" + tg_file.file_path
+                else:
+                    tg_file = await video.get_file()
+                    file_data = bytes(await tg_file.download_as_bytearray())
+                    filename = video.file_name or f"video_{video.file_unique_id}.mp4"
 
-            if not full_content.strip():
+            if not full_content.strip() and not file_data:
                 full_content = "[Empty message]"
 
             logger.info(f"Attempting to send message to Discord channel {discord_channel_id}: '{full_content}'")
+
+            if file_data:
+                # Upload file to Discord channel
+                discord_msg_id = await self._send_discord_channel_file(
+                    discord_channel_id, full_content, None, filename,
+                    message_reference, file_data
+                )
+                if discord_msg_id:
+                    message_doc = {
+                        "message_content": content,
+                        "discord_channel_id": discord_channel_id,
+                        "discord_message_id": discord_msg_id,
+                        "telegram_channel_id": TOPICS_CHANNEL_ID,
+                        "telegram_topic_id": topic_id,
+                        "telegram_message_id": update.message.message_id,
+                        "direction": "telegram_to_discord",
+                        "timestamp": datetime.utcnow(),
+                        "is_reply": message_reference is not None,
+                        "reply_to_discord_id": message_reference["message_id"] if message_reference else None,
+                        "is_channel_message": True
+                    }
+                    messages_collection.insert_one(message_doc)
+                return
 
             # Prepare the request payload
             payload = {
