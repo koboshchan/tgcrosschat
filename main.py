@@ -552,6 +552,15 @@ class MessageBridge:
             # Send the message
             headers = create_header(discord_client, DISCORD_TOKEN)
 
+            # Trigger typing indicator in Discord DM before sending the message
+            try:
+                requests.post(
+                    f"https://discord.com/api/v9/channels/{dm_channel_id}/typing",
+                    headers=headers
+                )
+            except Exception as e:
+                logger.debug(f"Failed to trigger Discord typing indicator: {e}")
+
             response = requests.post(
                 f"https://discord.com/api/v9/channels/{dm_channel_id}/messages",
                 json=payload,
@@ -749,6 +758,15 @@ class MessageBridge:
 
             # Send the message
             headers = create_header(discord_client, DISCORD_TOKEN)
+
+            # Trigger typing indicator in Discord channel before sending the message
+            try:
+                requests.post(
+                    f"https://discord.com/api/v9/channels/{discord_channel_id}/typing",
+                    headers=headers
+                )
+            except Exception as e:
+                logger.debug(f"Failed to trigger Discord typing indicator: {e}")
 
             response = requests.post(
                 f"https://discord.com/api/v9/channels/{discord_channel_id}/messages",
@@ -999,6 +1017,37 @@ async def on_message(message: discord.Message):
     # Handle server channel messages if they're connected
     if message.guild is not None:
         await bridge.forward_channel_to_telegram(message)
+
+@discord_client.event
+async def on_typing(channel, user, when):
+    # Ignore typing from the bot itself
+    if user == discord_client.user:
+        return
+
+    topic_id = None
+
+    # Handle DM typing
+    if isinstance(channel, discord.DMChannel):
+        mapping = mappings_collection.find_one({"discord_user_id": user.id})
+        if mapping:
+            topic_id = mapping["telegram_topic_id"]
+
+    # Handle server channel typing
+    elif hasattr(channel, 'guild') and channel.guild is not None:
+        mapping = channel_mappings_collection.find_one({"discord_channel_id": channel.id})
+        if mapping:
+            topic_id = mapping["telegram_topic_id"]
+
+    if topic_id is not None:
+        try:
+            await bridge.telegram_bot.send_chat_action(
+                chat_id=TOPICS_CHANNEL_ID,
+                message_thread_id=topic_id,
+                action="typing"
+            )
+            logger.debug(f"Forwarded typing indicator from Discord user {user.id} to Telegram topic {topic_id}")
+        except Exception as e:
+            logger.error(f"Failed to send typing action to Telegram: {e}")
 
 @discord_client.event
 async def on_message_edit(before: discord.Message, after: discord.Message):
