@@ -224,6 +224,9 @@ class MessageBridge:
                     else:
                         # Download to BytesIO and re-upload
                         file_response = requests.get(attachment.url)
+                        if file_response.status_code != 200:
+                            logger.error(f"Failed to download attachment {attachment.filename}: HTTP {file_response.status_code}")
+                            raise RuntimeError(f"Download failed with status {file_response.status_code}")
                         file_bio = io.BytesIO(file_response.content)
                         file_bio.name = attachment.filename
                         if attachment.content_type and attachment.content_type.startswith("image/"):
@@ -334,6 +337,9 @@ class MessageBridge:
                     else:
                         # Download to BytesIO and re-upload
                         file_response = requests.get(attachment.url)
+                        if file_response.status_code != 200:
+                            logger.error(f"Failed to download attachment {attachment.filename}: HTTP {file_response.status_code}")
+                            raise RuntimeError(f"Download failed with status {file_response.status_code}")
                         file_bio = io.BytesIO(file_response.content)
                         file_bio.name = attachment.filename
                         if attachment.content_type and attachment.content_type.startswith("image/"):
@@ -551,8 +557,8 @@ class MessageBridge:
             filename = None
             if update.message.photo:
                 photo = update.message.photo[-1]
-                file_size = photo.file_size or 0
-                if file_size > MAX_ATTACHMENT_SIZE:
+                file_size = photo.file_size
+                if file_size is None or file_size > MAX_ATTACHMENT_SIZE:
                     tg_file = await photo.get_file()
                     content = (content or "") + "\n" + tg_file.file_path
                 else:
@@ -562,8 +568,8 @@ class MessageBridge:
 
             elif update.message.document:
                 doc = update.message.document
-                file_size = doc.file_size or 0
-                if file_size > MAX_ATTACHMENT_SIZE:
+                file_size = doc.file_size
+                if file_size is None or file_size > MAX_ATTACHMENT_SIZE:
                     tg_file = await doc.get_file()
                     content = (content or "") + "\n" + tg_file.file_path
                 else:
@@ -573,8 +579,8 @@ class MessageBridge:
 
             elif update.message.video:
                 video = update.message.video
-                file_size = video.file_size or 0
-                if file_size > MAX_ATTACHMENT_SIZE:
+                file_size = video.file_size
+                if file_size is None or file_size > MAX_ATTACHMENT_SIZE:
                     tg_file = await video.get_file()
                     content = (content or "") + "\n" + tg_file.file_path
                 else:
@@ -794,8 +800,8 @@ class MessageBridge:
 
             if update.message.photo:
                 photo = update.message.photo[-1]
-                file_size = photo.file_size or 0
-                if file_size > MAX_ATTACHMENT_SIZE:
+                file_size = photo.file_size
+                if file_size is None or file_size > MAX_ATTACHMENT_SIZE:
                     tg_file = await photo.get_file()
                     full_content = (full_content or "") + "\n" + tg_file.file_path
                 else:
@@ -805,8 +811,8 @@ class MessageBridge:
 
             elif update.message.document:
                 doc = update.message.document
-                file_size = doc.file_size or 0
-                if file_size > MAX_ATTACHMENT_SIZE:
+                file_size = doc.file_size
+                if file_size is None or file_size > MAX_ATTACHMENT_SIZE:
                     tg_file = await doc.get_file()
                     full_content = (full_content or "") + "\n" + tg_file.file_path
                 else:
@@ -816,8 +822,8 @@ class MessageBridge:
 
             elif update.message.video:
                 video = update.message.video
-                file_size = video.file_size or 0
-                if file_size > MAX_ATTACHMENT_SIZE:
+                file_size = video.file_size
+                if file_size is None or file_size > MAX_ATTACHMENT_SIZE:
                     tg_file = await video.get_file()
                     full_content = (full_content or "") + "\n" + tg_file.file_path
                 else:
