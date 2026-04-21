@@ -554,10 +554,12 @@ class MessageBridge:
 
             # Trigger typing indicator in Discord DM before sending the message
             try:
-                requests.post(
+                typing_response = requests.post(
                     f"https://discord.com/api/v9/channels/{dm_channel_id}/typing",
                     headers=headers
                 )
+                if typing_response.status_code not in (200, 204):
+                    logger.debug(f"Discord typing indicator returned status {typing_response.status_code}")
             except Exception as e:
                 logger.debug(f"Failed to trigger Discord typing indicator: {e}")
 
@@ -761,10 +763,12 @@ class MessageBridge:
 
             # Trigger typing indicator in Discord channel before sending the message
             try:
-                requests.post(
+                typing_response = requests.post(
                     f"https://discord.com/api/v9/channels/{discord_channel_id}/typing",
                     headers=headers
                 )
+                if typing_response.status_code not in (200, 204):
+                    logger.debug(f"Discord typing indicator returned status {typing_response.status_code}")
             except Exception as e:
                 logger.debug(f"Failed to trigger Discord typing indicator: {e}")
 
@@ -1019,7 +1023,7 @@ async def on_message(message: discord.Message):
         await bridge.forward_channel_to_telegram(message)
 
 @discord_client.event
-async def on_typing(channel, user, when):
+async def on_typing(channel, user, when):  # `when` is provided by discord.py's event interface
     # Ignore typing from the bot itself
     if user == discord_client.user:
         return
