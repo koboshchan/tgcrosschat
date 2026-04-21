@@ -80,6 +80,35 @@ class InstanceManager:
                 return instance
         return None
 
+    GHCR_IMAGE = "ghcr.io/koboshchan/tgcrosschat:main"
+
+    COMPOSE_TEMPLATE = """\
+services:
+  tgcrosschat:
+    image: {image}
+    env_file:
+      - .env
+    environment:
+      - DISCORD_TOKEN=${{DISCORD_TOKEN}}
+      - TELEGRAM_BOT_TOKEN=${{TELEGRAM_BOT_TOKEN}}
+      - TOPICS_CHANNEL_ID=${{TOPICS_CHANNEL_ID}}
+    restart: unless-stopped
+    depends_on:
+      - mongo
+
+  mongo:
+    image: mongo:4.4
+    volumes:
+      - ./mongo_data:/data/db
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mongo", "--eval", "db.adminCommand('ping')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+"""
+
     def create_instance(self, chat_id: str, discord_token: str, telegram_token: str, topics_channel_id: str) -> Dict:
         """Create a new TGCrossChat instance"""
         # Generate unique hash for this instance
@@ -94,39 +123,24 @@ class InstanceManager:
             "status": "running"
         }
 
-        # Clone repository
+        # Create instance directory
         instance_path = self.instances_dir / instance_hash
         if instance_path.exists():
             shutil.rmtree(instance_path)
+        instance_path.mkdir(parents=True)
 
-        logger.info(f"Cloning repository to {instance_path}")
-        try:
-            subprocess.run([
-                "git", "clone",
-                "https://github.com/zlc1004/tgcrosschat.git",
-                str(instance_path)
-            ], check=True, capture_output=True, text=True)
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Git clone failed: {e}")
-            raise Exception(f"Failed to clone repository: {e.stderr}")
-
-        # Create .env file
-        env_example_path = instance_path / ".env.example"
-        env_path = instance_path / ".env"
-
-        if not env_example_path.exists():
-            raise Exception(".env.example not found in cloned repository")
-
-        # Read .env.example and replace values
-        with open(env_example_path, 'r') as f:
-            env_content = f.read()
-
-        # Replace placeholder values
-        env_content = env_content.replace("your_discord_user_token_here", discord_token)
-        env_content = env_content.replace("your_telegram_bot_token_here", telegram_token)
-        env_content = env_content.replace("your_telegram_topics_channel_id_here", topics_channel_id)
+        # Write compose.yaml using the GHCR image
+        compose_path = instance_path / "compose.yaml"
+        with open(compose_path, 'w') as f:
+            f.write(self.COMPOSE_TEMPLATE.format(image=self.GHCR_IMAGE))
 
         # Write .env file
+        env_content = (
+            f"DISCORD_TOKEN={discord_token}\n"
+            f"TELEGRAM_BOT_TOKEN={telegram_token}\n"
+            f"TOPICS_CHANNEL_ID={topics_channel_id}\n"
+        )
+        env_path = instance_path / ".env"
         with open(env_path, 'w') as f:
             f.write(env_content)
 
@@ -451,7 +465,7 @@ class InstanceManager:
             return False
 
     def update_instance(self, docker_stack_name: str) -> bool:
-        """Update instance: docker compose down, git pull, docker compose up -d --build"""
+        """Update instance: docker compose down, pull latest image from GHCR, docker compose up -d"""
         instance_path = self.instances_dir / docker_stack_name
 
         if not instance_path.exists():
@@ -465,16 +479,16 @@ class InstanceManager:
                 "docker", "compose", "-p", docker_stack_name, "down"
             ], cwd=instance_path, check=True, capture_output=True, text=True)
 
-            # Step 2: Git pull latest changes
-            logger.info(f"Pulling latest code for instance {docker_stack_name}")
+            # Step 2: Pull latest image from GHCR
+            logger.info(f"Pulling latest image for instance {docker_stack_name}")
             subprocess.run([
-                "git", "pull"
+                "docker", "compose", "-p", docker_stack_name, "pull"
             ], cwd=instance_path, check=True, capture_output=True, text=True)
 
-            # Step 3: Start containers with rebuild
-            logger.info(f"Rebuilding and starting containers for instance {docker_stack_name}")
+            # Step 3: Start containers with updated image
+            logger.info(f"Starting containers for instance {docker_stack_name}")
             subprocess.run([
-                "docker", "compose", "-p", docker_stack_name, "up", "-d", "--build"
+                "docker", "compose", "-p", docker_stack_name, "up", "-d"
             ], cwd=instance_path, check=True, capture_output=True, text=True)
 
             # Update instance status
@@ -963,7 +977,7 @@ async def resume_instance_action(update: Update, context: ContextTypes.DEFAULT_T
         )
 
 async def update_instance_action(update: Update, context: ContextTypes.DEFAULT_TYPE, instance_index: int):
-    """Update an instance (git pull + rebuild)"""
+    """Update an instance (pull latest image from GHCR + restart)"""
     instances = instance_manager.list_instances()
 
     if instance_index < 0 or instance_index >= len(instances):
@@ -983,8 +997,8 @@ async def update_instance_action(update: Update, context: ContextTypes.DEFAULT_T
         f"🔄 **Updating Instance**\n\n"
         f"Instance: `{short_id}...`\n\n"
         f"⏳ Step 1/3: Stopping containers...\n"
-        f"⏳ Step 2/3: Pulling latest code...\n"
-        f"⏳ Step 3/3: Rebuilding and starting...\n\n"
+        f"⏳ Step 2/3: Pulling latest image from GHCR...\n"
+        f"⏳ Step 3/3: Starting with updated image...\n\n"
         f"This may take a few moments...",
         parse_mode=ParseMode.MARKDOWN
     )
@@ -997,8 +1011,8 @@ async def update_instance_action(update: Update, context: ContextTypes.DEFAULT_T
                 f"✅ **Instance Updated Successfully**\n\n"
                 f"Instance: `{short_id}...`\n\n"
                 f"✅ Containers stopped\n"
-                f"✅ Code updated (git pull)\n"
-                f"✅ Rebuilt and restarted\n\n"
+                f"✅ Image updated (docker pull)\n"
+                f"✅ Restarted with latest image\n\n"
                 f"The instance is now running the latest version.",
                 parse_mode=ParseMode.MARKDOWN
             )

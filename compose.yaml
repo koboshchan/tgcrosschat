@@ -2,8 +2,7 @@ version: '3.8'
 
 services:
   tgcrosschat:
-    build:
-      context: .
+    image: ghcr.io/koboshchan/tgcrosschat:main
     env_file:
       - .env
     environment:
