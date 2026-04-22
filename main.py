@@ -114,6 +114,23 @@ discord_loop = None
 class MessageBridge:
     def __init__(self):
         self.telegram_bot = telegram_app.bot
+        # Maps topic_id -> (user_id, last_message_datetime) for header suppression
+        self._last_sender: dict = {}
+
+    def _should_show_header(self, topic_id: int, user_id: int) -> bool:
+        """Return False (suppress header) if the same user sent the last message in this topic within 30 seconds."""
+        entry = self._last_sender.get(topic_id)
+        if entry is None:
+            return True
+        last_user_id, last_time = entry
+        if last_user_id != user_id:
+            return True
+        elapsed = (datetime.utcnow() - last_time).total_seconds()
+        return elapsed > 30
+
+    def _update_last_sender(self, topic_id: int, user_id: int):
+        """Record the most recent sender for a topic."""
+        self._last_sender[topic_id] = (user_id, datetime.utcnow())
 
     async def get_or_create_topic(self, username: str, user_id: int, display_name: str = None) -> int:
         """Get existing topic ID for user or create a new one"""
@@ -183,7 +200,10 @@ class MessageBridge:
                     reply_to_message_id = reply_mapping["telegram_message_id"]
 
             # Prepare the message content
-            content = f"**{user_display_name}** (@{username}):\n{message.content}"
+            if self._should_show_header(topic_id, message.author.id):
+                content = f"**{user_display_name}** (@{username}):\n{message.content}"
+            else:
+                content = message.content
 
             # Send message to Telegram topic
             telegram_msg = await self.telegram_bot.send_message(
@@ -193,6 +213,8 @@ class MessageBridge:
                 parse_mode=ParseMode.MARKDOWN,
                 reply_to_message_id=reply_to_message_id
             )
+
+            self._update_last_sender(topic_id, message.author.id)
 
             # Store message mapping
             message_doc = {
@@ -298,7 +320,10 @@ class MessageBridge:
                     reply_to_message_id = reply_mapping["telegram_message_id"]
 
             # Prepare the message content
-            content = f"**{user_display_name}** (@{username}):\n{message.content}"
+            if self._should_show_header(topic_id, user_id):
+                content = f"**{user_display_name}** (@{username}):\n{message.content}"
+            else:
+                content = message.content
 
             # Send message to Telegram topic
             telegram_msg = await self.telegram_bot.send_message(
@@ -308,6 +333,8 @@ class MessageBridge:
                 parse_mode=ParseMode.MARKDOWN,
                 reply_to_message_id=reply_to_message_id
             )
+
+            self._update_last_sender(topic_id, user_id)
 
             # Store message mapping
             message_doc = {
