@@ -97,6 +97,22 @@ def initialize_database():
         messages_collection.create_index("discord_message_id")
         messages_collection.create_index("telegram_message_id")
 
+        # Migration: backfill custom_status field on existing mappings documents
+        result = mappings_collection.update_many(
+            {"custom_status": {"$exists": False}},
+            {"$set": {"custom_status": None}}
+        )
+        if result.modified_count > 0:
+            logger.info(f"Migration: added custom_status field to {result.modified_count} existing mapping(s)")
+
+        # Migration: backfill status_message_id field on existing mappings documents
+        result = mappings_collection.update_many(
+            {"status_message_id": {"$exists": False}},
+            {"$set": {"status_message_id": None}}
+        )
+        if result.modified_count > 0:
+            logger.info(f"Migration: added status_message_id field to {result.modified_count} existing mapping(s)")
+
         logger.info("Database initialization completed successfully")
         logger.info(f"Available collections: {db.list_collection_names()}")
 
@@ -152,6 +168,8 @@ class MessageBridge:
                 "discord_user_id": user_id,
                 "discord_username": username,
                 "telegram_topic_id": topic.message_thread_id,
+                "custom_status": None,
+                "status_message_id": None,
                 "created_at": datetime.utcnow()
             }
             mappings_collection.insert_one(mapping_doc)
@@ -1228,14 +1246,11 @@ async def on_presence_update(before, after):
     if after.id == discord_client.user.id:
         return
 
-    before_custom = _get_custom_activity(before)
     after_custom = _get_custom_activity(after)
-
-    before_text = before_custom.name if before_custom else None
     after_text = after_custom.name if after_custom else None
 
-    # Only proceed if the custom status text actually changed
-    if before_text == after_text:
+    # When a user goes offline Discord clears all activities; don't notify for that
+    if after_text is None and after.status == discord.Status.offline:
         return
 
     # Only notify if a DM topic already exists for this user
@@ -1244,26 +1259,74 @@ async def on_presence_update(before, after):
         return
 
     topic_id = mapping["telegram_topic_id"]
-    display_name = getattr(after, 'display_name', None) or getattr(after, 'name', str(after.id))
+    username = mapping["discord_username"]
+
+    # Compare against the last status we notified (DB-stored), not Discord's in-memory before
+    # This ensures duplicate suppression survives bot restarts
+    stored_status = mapping.get("custom_status")
+    if after_text == stored_status:
+        return
 
     if after_text:
         emoji_part = ""
         if after_custom and after_custom.emoji:
             emoji_part = f"{after_custom.emoji} "
-        status_msg = f"💬 **{display_name}** set their status to: {emoji_part}{after_text}"
+        status_msg = f"💬 **@{username}** set their status to: {emoji_part}{after_text}"
     else:
-        status_msg = f"💬 **{display_name}** cleared their custom status"
+        status_msg = f"💬 **@{username}** cleared their custom status"
 
+    status_message_id = mapping.get("status_message_id")
+
+    if status_message_id is not None:
+        # Edit the existing pinned status message
+        try:
+            await bridge.telegram_bot.edit_message_text(
+                chat_id=TOPICS_CHANNEL_ID,
+                message_id=status_message_id,
+                text=status_msg,
+                parse_mode=ParseMode.MARKDOWN
+            )
+            logger.debug(f"Edited pinned status message {status_message_id} for {username}")
+        except Exception as e:
+            logger.error(f"Failed to edit status message for {username}: {e}")
+            return
+    else:
+        # No stored status message — clear any existing pinned messages in the topic first,
+        # then send a fresh status message and pin it
+        try:
+            await bridge.telegram_bot.unpin_all_forum_topic_messages(
+                chat_id=TOPICS_CHANNEL_ID,
+                message_thread_id=topic_id
+            )
+        except Exception as e:
+            logger.debug(f"Could not unpin existing messages for {username} (may be none): {e}")
+
+        try:
+            sent = await bridge.telegram_bot.send_message(
+                chat_id=TOPICS_CHANNEL_ID,
+                message_thread_id=topic_id,
+                text=status_msg,
+                parse_mode=ParseMode.MARKDOWN
+            )
+            status_message_id = sent.message_id
+            await bridge.telegram_bot.pin_chat_message(
+                chat_id=TOPICS_CHANNEL_ID,
+                message_id=status_message_id,
+                disable_notification=True
+            )
+            logger.debug(f"Sent and pinned new status message {status_message_id} for {username}")
+        except Exception as e:
+            logger.error(f"Failed to send/pin status message for {username}: {e}")
+            return
+
+    # Persist the updated status and message ID
     try:
-        await bridge.telegram_bot.send_message(
-            chat_id=TOPICS_CHANNEL_ID,
-            message_thread_id=topic_id,
-            text=status_msg,
-            parse_mode=ParseMode.MARKDOWN
+        mappings_collection.update_one(
+            {"discord_user_id": after.id},
+            {"$set": {"custom_status": after_text, "status_message_id": status_message_id}}
         )
-        logger.debug(f"Sent custom status update for {display_name} to Telegram topic {topic_id}")
     except Exception as e:
-        logger.error(f"Failed to send status update to Telegram: {e}")
+        logger.error(f"Failed to persist status info for {username}: {e}")
 
 # Telegram handlers
 async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
