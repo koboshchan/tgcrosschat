@@ -1215,6 +1215,56 @@ async def on_message_edit(before: discord.Message, after: discord.Message):
     if after.guild is not None:
         await bridge.edit_channel_message_in_telegram(before, after)
 
+def _get_custom_activity(member) -> discord.CustomActivity | None:
+    """Return the CustomActivity for a member, or None if not set."""
+    for activity in getattr(member, 'activities', []):
+        if isinstance(activity, discord.CustomActivity):
+            return activity
+    return None
+
+@discord_client.event
+async def on_presence_update(before, after):
+    # Ignore self
+    if after.id == discord_client.user.id:
+        return
+
+    before_custom = _get_custom_activity(before)
+    after_custom = _get_custom_activity(after)
+
+    before_text = before_custom.name if before_custom else None
+    after_text = after_custom.name if after_custom else None
+
+    # Only proceed if the custom status text actually changed
+    if before_text == after_text:
+        return
+
+    # Only notify if a DM topic already exists for this user
+    mapping = mappings_collection.find_one({"discord_user_id": after.id})
+    if not mapping:
+        return
+
+    topic_id = mapping["telegram_topic_id"]
+    display_name = getattr(after, 'display_name', None) or getattr(after, 'name', str(after.id))
+
+    if after_text:
+        emoji_part = ""
+        if after_custom and after_custom.emoji:
+            emoji_part = f"{after_custom.emoji} "
+        status_msg = f"💬 **{display_name}** set their status to: {emoji_part}{after_text}"
+    else:
+        status_msg = f"💬 **{display_name}** cleared their custom status"
+
+    try:
+        await bridge.telegram_bot.send_message(
+            chat_id=TOPICS_CHANNEL_ID,
+            message_thread_id=topic_id,
+            text=status_msg,
+            parse_mode=ParseMode.MARKDOWN
+        )
+        logger.debug(f"Sent custom status update for {display_name} to Telegram topic {topic_id}")
+    except Exception as e:
+        logger.error(f"Failed to send status update to Telegram: {e}")
+
 # Telegram handlers
 async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle incoming Telegram messages"""
