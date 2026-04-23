@@ -97,6 +97,14 @@ def initialize_database():
         messages_collection.create_index("discord_message_id")
         messages_collection.create_index("telegram_message_id")
 
+        # Migration: backfill custom_status field on existing mappings documents
+        result = mappings_collection.update_many(
+            {"custom_status": {"$exists": False}},
+            {"$set": {"custom_status": None}}
+        )
+        if result.modified_count > 0:
+            logger.info(f"Migration: added custom_status field to {result.modified_count} existing mapping(s)")
+
         logger.info("Database initialization completed successfully")
         logger.info(f"Available collections: {db.list_collection_names()}")
 
@@ -152,6 +160,7 @@ class MessageBridge:
                 "discord_user_id": user_id,
                 "discord_username": username,
                 "telegram_topic_id": topic.message_thread_id,
+                "custom_status": None,
                 "created_at": datetime.utcnow()
             }
             mappings_collection.insert_one(mapping_doc)
@@ -1228,15 +1237,8 @@ async def on_presence_update(before, after):
     if after.id == discord_client.user.id:
         return
 
-    before_custom = _get_custom_activity(before)
     after_custom = _get_custom_activity(after)
-
-    before_text = before_custom.name if before_custom else None
     after_text = after_custom.name if after_custom else None
-
-    # Only proceed if the custom status text actually changed
-    if before_text == after_text:
-        return
 
     # When a user goes offline Discord clears all activities; don't notify for that
     if after_text is None and after.status == discord.Status.offline:
@@ -1249,6 +1251,12 @@ async def on_presence_update(before, after):
 
     topic_id = mapping["telegram_topic_id"]
     username = mapping["discord_username"]
+
+    # Compare against the last status we notified (DB-stored), not Discord's in-memory before
+    # This ensures duplicate suppression survives bot restarts
+    stored_status = mapping.get("custom_status")
+    if after_text == stored_status:
+        return
 
     if after_text:
         emoji_part = ""
@@ -1264,6 +1272,11 @@ async def on_presence_update(before, after):
             message_thread_id=topic_id,
             text=status_msg,
             parse_mode=ParseMode.MARKDOWN
+        )
+        # Persist the newly notified status so future comparisons use the DB value
+        mappings_collection.update_one(
+            {"discord_user_id": after.id},
+            {"$set": {"custom_status": after_text}}
         )
         logger.debug(f"Sent custom status update for {username} to Telegram topic {topic_id}")
     except Exception as e:
