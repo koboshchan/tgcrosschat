@@ -1247,10 +1247,13 @@ async def on_presence_update(before, after):
     username = getattr(after, 'name', None)
     # Use global_name if it exists and is different from username, otherwise use display_name
     try:
-        global_name = after.global_name
+        resolved_name = after.global_name
     except AttributeError:
-        global_name = getattr(after, 'display_name', None)  # Fallback for older discord.py versions
-    display_name = global_name if (global_name and global_name != username) else getattr(after, 'display_name', None) or username
+        resolved_name = None  # Fallback for older discord.py versions
+    if resolved_name and resolved_name != username:
+        display_name = resolved_name
+    else:
+        display_name = getattr(after, 'display_name', None) or username
     # Last resort: look up the user from the bot's cache
     if not display_name:
         cached_user = discord_client.get_user(after.id)
