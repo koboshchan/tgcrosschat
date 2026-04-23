@@ -105,6 +105,14 @@ def initialize_database():
         if result.modified_count > 0:
             logger.info(f"Migration: added custom_status field to {result.modified_count} existing mapping(s)")
 
+        # Migration: backfill status_message_id field on existing mappings documents
+        result = mappings_collection.update_many(
+            {"status_message_id": {"$exists": False}},
+            {"$set": {"status_message_id": None}}
+        )
+        if result.modified_count > 0:
+            logger.info(f"Migration: added status_message_id field to {result.modified_count} existing mapping(s)")
+
         logger.info("Database initialization completed successfully")
         logger.info(f"Available collections: {db.list_collection_names()}")
 
@@ -161,6 +169,7 @@ class MessageBridge:
                 "discord_username": username,
                 "telegram_topic_id": topic.message_thread_id,
                 "custom_status": None,
+                "status_message_id": None,
                 "created_at": datetime.utcnow()
             }
             mappings_collection.insert_one(mapping_doc)
@@ -1266,27 +1275,49 @@ async def on_presence_update(before, after):
     else:
         status_msg = f"💬 **@{username}** cleared their custom status"
 
-    try:
-        await bridge.telegram_bot.send_message(
-            chat_id=TOPICS_CHANNEL_ID,
-            message_thread_id=topic_id,
-            text=status_msg,
-            parse_mode=ParseMode.MARKDOWN
-        )
-        logger.debug(f"Sent custom status update for {username} to Telegram topic {topic_id}")
-    except Exception as e:
-        logger.error(f"Failed to send status update to Telegram: {e}")
-        return
+    status_message_id = mapping.get("status_message_id")
 
-    # Persist the newly notified status; done outside the send try/except so a DB failure
-    # doesn't suppress the already-sent notification on the next event
+    if status_message_id:
+        # Edit the existing pinned status message
+        try:
+            await bridge.telegram_bot.edit_message_text(
+                chat_id=TOPICS_CHANNEL_ID,
+                message_id=status_message_id,
+                text=status_msg,
+                parse_mode=ParseMode.MARKDOWN
+            )
+            logger.debug(f"Edited pinned status message {status_message_id} for {username}")
+        except Exception as e:
+            logger.error(f"Failed to edit status message for {username}: {e}")
+            return
+    else:
+        # No pinned status message yet — send a new one and pin it
+        try:
+            sent = await bridge.telegram_bot.send_message(
+                chat_id=TOPICS_CHANNEL_ID,
+                message_thread_id=topic_id,
+                text=status_msg,
+                parse_mode=ParseMode.MARKDOWN
+            )
+            status_message_id = sent.message_id
+            await bridge.telegram_bot.pin_chat_message(
+                chat_id=TOPICS_CHANNEL_ID,
+                message_id=status_message_id,
+                disable_notification=True
+            )
+            logger.debug(f"Sent and pinned new status message {status_message_id} for {username}")
+        except Exception as e:
+            logger.error(f"Failed to send/pin status message for {username}: {e}")
+            return
+
+    # Persist the updated status and message ID
     try:
         mappings_collection.update_one(
             {"discord_user_id": after.id},
-            {"$set": {"custom_status": after_text}}
+            {"$set": {"custom_status": after_text, "status_message_id": status_message_id}}
         )
     except Exception as e:
-        logger.error(f"Failed to persist custom_status for {username}: {e}")
+        logger.error(f"Failed to persist status info for {username}: {e}")
 
 # Telegram handlers
 async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
