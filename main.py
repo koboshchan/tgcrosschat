@@ -1244,7 +1244,22 @@ async def on_presence_update(before, after):
         return
 
     topic_id = mapping["telegram_topic_id"]
-    display_name = getattr(after, 'display_name', None) or getattr(after, 'name', str(after.id))
+    username = getattr(after, 'name', None)
+    # Use global_name if it exists and is different from username, otherwise use display_name
+    try:
+        global_name = after.global_name
+    except AttributeError:
+        global_name = getattr(after, 'display_name', None)  # Fallback for older discord.py versions
+    display_name = global_name if (global_name and global_name != username) else getattr(after, 'display_name', None) or username
+    # Last resort: look up the user from the bot's cache
+    if not display_name:
+        cached_user = discord_client.get_user(after.id)
+        if cached_user:
+            try:
+                display_name = cached_user.global_name or cached_user.name
+            except AttributeError:
+                display_name = getattr(cached_user, 'name', None)
+        display_name = display_name or str(after.id)
 
     if after_text:
         emoji_part = ""
