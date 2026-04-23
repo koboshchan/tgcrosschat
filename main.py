@@ -1291,7 +1291,16 @@ async def on_presence_update(before, after):
             logger.error(f"Failed to edit status message for {username}: {e}")
             return
     else:
-        # No pinned status message yet — send a new one and pin it
+        # No stored status message — clear any existing pinned messages in the topic first,
+        # then send a fresh status message and pin it
+        try:
+            await bridge.telegram_bot.unpin_all_forum_topic_messages(
+                chat_id=TOPICS_CHANNEL_ID,
+                message_thread_id=topic_id
+            )
+        except Exception as e:
+            logger.debug(f"Could not unpin existing messages for {username} (may be none): {e}")
+
         try:
             sent = await bridge.telegram_bot.send_message(
                 chat_id=TOPICS_CHANNEL_ID,
