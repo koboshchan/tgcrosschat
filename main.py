@@ -1277,7 +1277,7 @@ async def on_presence_update(before, after):
 
     status_message_id = mapping.get("status_message_id")
 
-    if status_message_id:
+    if status_message_id is not None:
         # Edit the existing pinned status message
         try:
             await bridge.telegram_bot.edit_message_text(
