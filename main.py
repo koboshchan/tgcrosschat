@@ -1273,14 +1273,20 @@ async def on_presence_update(before, after):
             text=status_msg,
             parse_mode=ParseMode.MARKDOWN
         )
-        # Persist the newly notified status so future comparisons use the DB value
+        logger.debug(f"Sent custom status update for {username} to Telegram topic {topic_id}")
+    except Exception as e:
+        logger.error(f"Failed to send status update to Telegram: {e}")
+        return
+
+    # Persist the newly notified status; done outside the send try/except so a DB failure
+    # doesn't suppress the already-sent notification on the next event
+    try:
         mappings_collection.update_one(
             {"discord_user_id": after.id},
             {"$set": {"custom_status": after_text}}
         )
-        logger.debug(f"Sent custom status update for {username} to Telegram topic {topic_id}")
     except Exception as e:
-        logger.error(f"Failed to send status update to Telegram: {e}")
+        logger.error(f"Failed to persist custom_status for {username}: {e}")
 
 # Telegram handlers
 async def handle_telegram_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
