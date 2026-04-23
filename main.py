@@ -1220,7 +1220,7 @@ async def on_presence_update(before, after):
         return
 
     topic_id = mapping["telegram_topic_id"]
-    username = mapping.get("discord_username") or getattr(after, 'name', str(after.id))
+    username = mapping["discord_username"]
 
     if after_text:
         emoji_part = ""
