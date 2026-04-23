@@ -132,7 +132,7 @@ class MessageBridge:
         """Record the most recent sender for a topic."""
         self._last_sender[topic_id] = (user_id, datetime.utcnow())
 
-    async def get_or_create_topic(self, username: str, user_id: int) -> int:
+    async def get_or_create_topic(self, username: str, user_id: int, display_name: str = None) -> int:
         """Get existing topic ID for user or create a new one"""
         # Check if mapping exists
         mapping = mappings_collection.find_one({"discord_user_id": user_id})
@@ -140,8 +140,8 @@ class MessageBridge:
             return mapping["telegram_topic_id"]
 
         try:
-            # Create a new topic for this user
-            topic_name = f"DM with @{username}"
+            # Create a new topic for this user with display name and username
+            topic_name = f"DM with {display_name or username}({username})"
             topic = await self.telegram_bot.create_forum_topic(
                 chat_id=TOPICS_CHANNEL_ID,
                 name=topic_name
@@ -179,6 +179,12 @@ class MessageBridge:
 
         topic_id = mapping["telegram_topic_id"]
         username = message.author.name
+        # Use global_name if it exists and is different from username, otherwise use display_name
+        try:
+            global_name = message.author.global_name
+        except AttributeError:
+            global_name = message.author.display_name  # Fallback for older discord.py versions
+        user_display_name = global_name if (global_name and global_name != username) else message.author.display_name
         channel_name = message.channel.name
 
         try:
@@ -195,7 +201,7 @@ class MessageBridge:
 
             # Prepare the message content
             if self._should_show_header(topic_id, message.author.id):
-                content = f"**@{username}**:\n{message.content}"
+                content = f"**{user_display_name}** (@{username}):\n{message.content}"
             else:
                 content = message.content
 
@@ -235,7 +241,7 @@ class MessageBridge:
                         telegram_attachment = await self.telegram_bot.send_message(
                             chat_id=TOPICS_CHANNEL_ID,
                             message_thread_id=topic_id,
-                            text=f"📎 {attachment.filename} (from @{username}): {attachment.url}"
+                            text=f"📎 {attachment.filename} (from {user_display_name}): {attachment.url}"
                         )
                     else:
                         # Download to BytesIO and re-upload
@@ -250,14 +256,14 @@ class MessageBridge:
                                 chat_id=TOPICS_CHANNEL_ID,
                                 message_thread_id=topic_id,
                                 photo=file_bio,
-                                caption=f"Image from @{username}"
+                                caption=f"Image from {user_display_name}"
                             )
                         else:
                             telegram_attachment = await self.telegram_bot.send_document(
                                 chat_id=TOPICS_CHANNEL_ID,
                                 message_thread_id=topic_id,
                                 document=file_bio,
-                                caption=f"File from @{username}: {attachment.filename}"
+                                caption=f"File from {user_display_name}: {attachment.filename}"
                             )
 
                     # Store attachment mapping
@@ -290,11 +296,17 @@ class MessageBridge:
     async def forward_discord_to_telegram(self, message: discord.Message):
         """Forward Discord DM to Telegram topic"""
         username = message.author.name
+        # Use global_name if it exists and is different from username, otherwise use display_name
+        try:
+            global_name = message.author.global_name
+        except AttributeError:
+            global_name = message.author.display_name  # Fallback for older discord.py versions
+        user_display_name = global_name if (global_name and global_name != username) else message.author.display_name
         user_id = message.author.id
 
         try:
             # Get or create topic for this user
-            topic_id = await self.get_or_create_topic(username, user_id)
+            topic_id = await self.get_or_create_topic(username, user_id, user_display_name)
 
             # Check if this is a reply to another message
             reply_to_message_id = None
@@ -309,7 +321,7 @@ class MessageBridge:
 
             # Prepare the message content
             if self._should_show_header(topic_id, user_id):
-                content = f"**@{username}**:\n{message.content}"
+                content = f"**{user_display_name}** (@{username}):\n{message.content}"
             else:
                 content = message.content
 
@@ -347,7 +359,7 @@ class MessageBridge:
                         telegram_attachment = await self.telegram_bot.send_message(
                             chat_id=TOPICS_CHANNEL_ID,
                             message_thread_id=topic_id,
-                            text=f"📎 {attachment.filename} (from @{username}): {attachment.url}"
+                            text=f"📎 {attachment.filename} (from {user_display_name}): {attachment.url}"
                         )
                     else:
                         # Download to BytesIO and re-upload
@@ -362,14 +374,14 @@ class MessageBridge:
                                 chat_id=TOPICS_CHANNEL_ID,
                                 message_thread_id=topic_id,
                                 photo=file_bio,
-                                caption=f"Image from @{username}"
+                                caption=f"Image from {user_display_name}"
                             )
                         else:
                             telegram_attachment = await self.telegram_bot.send_document(
                                 chat_id=TOPICS_CHANNEL_ID,
                                 message_thread_id=topic_id,
                                 document=file_bio,
-                                caption=f"File from @{username}: {attachment.filename}"
+                                caption=f"File from {user_display_name}: {attachment.filename}"
                             )
 
                     # Store attachment mapping
@@ -419,8 +431,14 @@ class MessageBridge:
 
             # Prepare the updated content
             username = after.author.name
+            # Use global_name if it exists and is different from username, otherwise use display_name
+            try:
+                global_name = after.author.global_name
+            except AttributeError:
+                global_name = after.author.display_name  # Fallback for older discord.py versions
+            user_display_name = global_name if (global_name and global_name != username) else after.author.display_name
             channel_name = after.channel.name
-            content = f"**@{username}** *[edited]*:\n{after.content}"
+            content = f"**{user_display_name}** (@{username}) *[edited]*:\n{after.content}"
 
             # Edit the Telegram message
             await self.telegram_bot.edit_message_text(
@@ -461,7 +479,13 @@ class MessageBridge:
 
             # Prepare the updated content
             username = after.author.name
-            content = f"**@{username}** *[edited]*:\n{after.content}"
+            # Use global_name if it exists and is different from username, otherwise use display_name
+            try:
+                global_name = after.author.global_name
+            except AttributeError:
+                global_name = after.author.display_name  # Fallback for older discord.py versions
+            user_display_name = global_name if (global_name and global_name != username) else after.author.display_name
+            content = f"**{user_display_name}** (@{username}) *[edited]*:\n{after.content}"
 
             # Edit the Telegram message
             await self.telegram_bot.edit_message_text(
@@ -1212,6 +1236,10 @@ async def on_presence_update(before, after):
 
     # Only proceed if the custom status text actually changed
     if before_text == after_text:
+        return
+
+    # When a user goes offline Discord clears all activities; don't notify for that
+    if after_text is None and after.status == discord.Status.offline:
         return
 
     # Only notify if a DM topic already exists for this user
