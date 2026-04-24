@@ -1475,16 +1475,7 @@ async def on_presence_update(before, after):
             status_message_id = None
 
     if need_new_message:
-        # Delete the old status message (if we know its ID) and unpin everything else
-        if status_message_id is not None:
-            try:
-                await bridge.telegram_bot.delete_message(
-                    chat_id=TOPICS_CHANNEL_ID,
-                    message_id=status_message_id
-                )
-                logger.debug(f"Deleted old status message {status_message_id} for {username}")
-            except Exception as e:
-                logger.debug(f"Could not delete old status message for {username} (may already be gone): {e}")
+        # Unpin old topic messages and send a fresh status message
         try:
             await bridge.telegram_bot.unpin_all_forum_topic_messages(
                 chat_id=TOPICS_CHANNEL_ID,
@@ -1723,18 +1714,6 @@ async def resetstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE
             parse_mode=ParseMode.MARKDOWN
         )
         return
-
-    old_status_message_id = mapping.get("status_message_id")
-
-    # Delete the pinned status message if we know it
-    if old_status_message_id is not None:
-        try:
-            await update.get_bot().delete_message(
-                chat_id=TOPICS_CHANNEL_ID,
-                message_id=old_status_message_id
-            )
-        except Exception as e:
-            logger.debug(f"Could not delete status message during resetstatus: {e}")
 
     collection.update_one(
         {"_id": mapping["_id"]},
