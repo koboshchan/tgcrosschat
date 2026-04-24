@@ -60,6 +60,31 @@ if not DISCORD_TOKEN or not TELEGRAM_BOT_TOKEN or not TOPICS_CHANNEL_ID:
 
 MAX_ATTACHMENT_SIZE = 5 * 1024 * 1024  # 5 MB
 
+def escape_markdown(text: str) -> str:
+    """Escape special characters for Telegram Markdown v1, avoiding URLs."""
+    if not text:
+        return text
+    # Don't escape URLs - look for http:// or https://
+    # Split on URLs and only escape the non-URL parts
+    import re
+    url_pattern = r'https?://\S+'
+    
+    def escape_non_url(match_obj):
+        # If it's a URL (matched pattern), return as-is; otherwise escape
+        return match_obj.group(0)
+    
+    parts = re.split(f'({url_pattern})', text)
+    result = []
+    for i, part in enumerate(parts):
+        if i % 2 == 0:  # Non-URL parts
+            # Escape backslash first, then other Markdown special characters
+            # But NOT parentheses, since they appear in normal text and escaping breaks readability
+            escaped = part.replace("\\", "\\\\").replace("_", "\\_").replace("*", "\\*").replace("[", "\\[").replace("]", "\\]").replace("`", "\\`").replace("~", "\\~")
+            result.append(escaped)
+        else:  # URL parts
+            result.append(part)
+    return ''.join(result)
+
 # MongoDB connection (using Docker DNS)
 mongo_client = MongoClient('mongodb://mongo:27017/')
 db = mongo_client.tgcrosschat
@@ -146,6 +171,8 @@ class MessageBridge:
         self.telegram_bot = telegram_app.bot
         # Maps topic_id -> (user_id, last_message_datetime) for header suppression
         self._last_sender: dict = {}
+        # Maps discord_user_id -> (status_text, timestamp) for status deduplication
+        self._last_status_sent: dict = {}
 
     def _should_show_header(self, topic_id: int, user_id: int) -> bool:
         """Return False (suppress header) if the same user sent the last message in this topic within 30 seconds."""
@@ -161,6 +188,24 @@ class MessageBridge:
     def _update_last_sender(self, topic_id: int, user_id: int):
         """Record the most recent sender for a topic."""
         self._last_sender[topic_id] = (user_id, datetime.utcnow())
+
+    def _should_send_status_update(self, user_id: int, status_text: str | None) -> bool:
+        """Return True only if this status update should be sent (deduplicates rapid Discord presence events).
+        
+        Returns False if the same status was sent to this user within the last 3 seconds.
+        """
+        entry = self._last_status_sent.get(user_id)
+        if entry is None:
+            return True
+        last_status, last_time = entry
+        if last_status != status_text:
+            return True
+        elapsed = (datetime.utcnow() - last_time).total_seconds()
+        return elapsed > 3
+
+    def _record_status_sent(self, user_id: int, status_text: str | None):
+        """Record that a status update was sent for this user."""
+        self._last_status_sent[user_id] = (status_text, datetime.utcnow())
 
     async def get_or_create_topic(self, username: str, user_id: int, display_name: str = None) -> int:
         """Get existing topic ID for user or create a new one"""
@@ -233,54 +278,109 @@ class MessageBridge:
 
             # Prepare the message content
             if self._should_show_header(topic_id, message.author.id):
-                content = f"**{user_display_name}** (@{username}):\n{message.content}"
+                content = f"**{escape_markdown(user_display_name)}** (@{escape_markdown(username)}):\n{escape_markdown(message.content)}"
             else:
-                content = message.content
+                content = escape_markdown(message.content)
 
-            # Send message to Telegram topic
-            telegram_msg = await self.telegram_bot.send_message(
-                chat_id=TOPICS_CHANNEL_ID,
-                message_thread_id=topic_id,
-                text=content,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_to_message_id=reply_to_message_id
-            )
+            # Determine if we should send text message separately or with attachment
+            has_image = any(a.content_type and a.content_type.startswith("image/") for a in message.attachments if a.size <= MAX_ATTACHMENT_SIZE)
+            text_message_sent = False
 
-            self._update_last_sender(topic_id, message.author.id)
+            # If there's an image and text content, send as image with caption instead of separate message
+            if has_image and content.strip():
+                for attachment in message.attachments:
+                    if attachment.content_type and attachment.content_type.startswith("image/") and attachment.size <= MAX_ATTACHMENT_SIZE:
+                        try:
+                            file_response = requests.get(attachment.url)
+                            if file_response.status_code != 200:
+                                logger.error(f"Failed to download image {attachment.filename}: HTTP {file_response.status_code}")
+                                continue
+                            file_bio = io.BytesIO(file_response.content)
+                            file_bio.name = attachment.filename
+                            telegram_msg = await self.telegram_bot.send_photo(
+                                chat_id=TOPICS_CHANNEL_ID,
+                                message_thread_id=topic_id,
+                                photo=file_bio,
+                                caption=content,
+                                parse_mode=ParseMode.MARKDOWN,
+                                reply_to_message_id=reply_to_message_id
+                            )
+                            text_message_sent = True
 
-            # Store message mapping
-            message_doc = {
-                "message_content": message.content,
-                "discord_channel_id": channel_id,
-                "discord_message_id": message.id,
-                "telegram_channel_id": TOPICS_CHANNEL_ID,
-                "telegram_topic_id": topic_id,
-                "telegram_message_id": telegram_msg.message_id,
-                "direction": "discord_to_telegram",
-                "timestamp": datetime.utcnow(),
-                "is_reply": reply_to_message_id is not None,
-                "reply_to_telegram_id": reply_to_message_id,
-                "is_channel_message": True,
-                "channel_name": channel_name
-            }
-            messages_collection.insert_one(message_doc)
+                            # Store message mapping
+                            message_doc = {
+                                "message_content": message.content,
+                                "discord_channel_id": channel_id,
+                                "discord_message_id": message.id,
+                                "telegram_channel_id": TOPICS_CHANNEL_ID,
+                                "telegram_topic_id": topic_id,
+                                "telegram_message_id": telegram_msg.message_id,
+                                "direction": "discord_to_telegram",
+                                "timestamp": datetime.utcnow(),
+                                "is_reply": reply_to_message_id is not None,
+                                "reply_to_telegram_id": reply_to_message_id,
+                                "is_channel_message": True,
+                                "channel_name": channel_name,
+                                "has_attachment": True,
+                                "attachment_filename": attachment.filename
+                            }
+                            messages_collection.insert_one(message_doc)
+                            self._update_last_sender(topic_id, message.author.id)
+                            break  # Send only first image with caption
+                        except Exception as e:
+                            logger.error(f"Failed to send channel image with caption: {e}")
 
-            # Handle attachments
+            # If we haven't sent the message yet (no image with caption), send as text (if not empty)
+            if not text_message_sent and content.strip():
+                telegram_msg = await self.telegram_bot.send_message(
+                    chat_id=TOPICS_CHANNEL_ID,
+                    message_thread_id=topic_id,
+                    text=content,
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_to_message_id=reply_to_message_id
+                )
+
+                self._update_last_sender(topic_id, message.author.id)
+
+                # Store message mapping
+                message_doc = {
+                    "message_content": message.content,
+                    "discord_channel_id": channel_id,
+                    "discord_message_id": message.id,
+                    "telegram_channel_id": TOPICS_CHANNEL_ID,
+                    "telegram_topic_id": topic_id,
+                    "telegram_message_id": telegram_msg.message_id,
+                    "direction": "discord_to_telegram",
+                    "timestamp": datetime.utcnow(),
+                    "is_reply": reply_to_message_id is not None,
+                    "reply_to_telegram_id": reply_to_message_id,
+                    "is_channel_message": True,
+                    "channel_name": channel_name
+                }
+                messages_collection.insert_one(message_doc)
+
+            # Handle remaining attachments (skip first image if it was already sent with caption)
+            first_image_skipped = text_message_sent
             for attachment in message.attachments:
                 try:
+                    # Skip first image if it was already sent with caption
+                    if first_image_skipped and attachment.content_type and attachment.content_type.startswith("image/") and attachment.size <= MAX_ATTACHMENT_SIZE:
+                        first_image_skipped = False
+                        continue
+
                     if attachment.size > MAX_ATTACHMENT_SIZE:
                         # File too large to re-upload; send as a link
                         telegram_attachment = await self.telegram_bot.send_message(
                             chat_id=TOPICS_CHANNEL_ID,
                             message_thread_id=topic_id,
-                            text=f"📎 {attachment.filename} (from {user_display_name}): {attachment.url}"
+                            text=f"📎 {escape_markdown(attachment.filename)} (from {escape_markdown(user_display_name)}): {attachment.url}"
                         )
                     else:
                         # Download to BytesIO and re-upload
                         file_response = requests.get(attachment.url)
                         if file_response.status_code != 200:
                             logger.error(f"Failed to download attachment {attachment.filename}: HTTP {file_response.status_code}")
-                            raise RuntimeError(f"Download failed with status {file_response.status_code}")
+                            continue  # Skip this attachment instead of raising
                         file_bio = io.BytesIO(file_response.content)
                         file_bio.name = attachment.filename
                         if attachment.content_type and attachment.content_type.startswith("image/"):
@@ -288,14 +388,14 @@ class MessageBridge:
                                 chat_id=TOPICS_CHANNEL_ID,
                                 message_thread_id=topic_id,
                                 photo=file_bio,
-                                caption=f"Image from {user_display_name}"
+                                caption=f"Image from {escape_markdown(user_display_name)}"
                             )
                         else:
                             telegram_attachment = await self.telegram_bot.send_document(
                                 chat_id=TOPICS_CHANNEL_ID,
                                 message_thread_id=topic_id,
                                 document=file_bio,
-                                caption=f"File from {user_display_name}: {attachment.filename}"
+                                caption=f"File from {escape_markdown(user_display_name)}: {escape_markdown(attachment.filename)}"
                             )
 
                     # Store attachment mapping
@@ -353,52 +453,105 @@ class MessageBridge:
 
             # Prepare the message content
             if self._should_show_header(topic_id, user_id):
-                content = f"**{user_display_name}** (@{username}):\n{message.content}"
+                content = f"**{escape_markdown(user_display_name)}** (@{escape_markdown(username)}):\n{escape_markdown(message.content)}"
             else:
-                content = message.content
+                content = escape_markdown(message.content)
 
-            # Send message to Telegram topic
-            telegram_msg = await self.telegram_bot.send_message(
-                chat_id=TOPICS_CHANNEL_ID,
-                message_thread_id=topic_id,
-                text=content,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_to_message_id=reply_to_message_id
-            )
+            # Determine if we should send text message separately or with attachment
+            has_image = any(a.content_type and a.content_type.startswith("image/") for a in message.attachments if a.size <= MAX_ATTACHMENT_SIZE)
+            text_message_sent = False
 
-            self._update_last_sender(topic_id, user_id)
+            # If there's an image and text content, send as image with caption instead of separate message
+            if has_image and content.strip():
+                for attachment in message.attachments:
+                    if attachment.content_type and attachment.content_type.startswith("image/") and attachment.size <= MAX_ATTACHMENT_SIZE:
+                        try:
+                            file_response = requests.get(attachment.url)
+                            if file_response.status_code != 200:
+                                logger.error(f"Failed to download image {attachment.filename}: HTTP {file_response.status_code}")
+                                continue
+                            file_bio = io.BytesIO(file_response.content)
+                            file_bio.name = attachment.filename
+                            telegram_msg = await self.telegram_bot.send_photo(
+                                chat_id=TOPICS_CHANNEL_ID,
+                                message_thread_id=topic_id,
+                                photo=file_bio,
+                                caption=content,
+                                parse_mode=ParseMode.MARKDOWN,
+                                reply_to_message_id=reply_to_message_id
+                            )
+                            text_message_sent = True
 
-            # Store message mapping
-            message_doc = {
-                "message_content": message.content,
-                "discord_channel_id": message.author.id,  # For DMs, channel ID = user ID
-                "discord_message_id": message.id,
-                "telegram_channel_id": TOPICS_CHANNEL_ID,
-                "telegram_topic_id": topic_id,
-                "telegram_message_id": telegram_msg.message_id,
-                "direction": "discord_to_telegram",
-                "timestamp": datetime.utcnow(),
-                "is_reply": reply_to_message_id is not None,
-                "reply_to_telegram_id": reply_to_message_id
-            }
-            messages_collection.insert_one(message_doc)
+                            # Store message mapping
+                            message_doc = {
+                                "message_content": message.content,
+                                "discord_channel_id": message.author.id,
+                                "discord_message_id": message.id,
+                                "telegram_channel_id": TOPICS_CHANNEL_ID,
+                                "telegram_topic_id": topic_id,
+                                "telegram_message_id": telegram_msg.message_id,
+                                "direction": "discord_to_telegram",
+                                "timestamp": datetime.utcnow(),
+                                "is_reply": reply_to_message_id is not None,
+                                "reply_to_telegram_id": reply_to_message_id,
+                                "has_attachment": True,
+                                "attachment_filename": attachment.filename
+                            }
+                            messages_collection.insert_one(message_doc)
+                            self._update_last_sender(topic_id, user_id)
+                            break  # Send only first image with caption
+                        except Exception as e:
+                            logger.error(f"Failed to send image with caption: {e}")
 
-            # Handle attachments
+            # If we haven't sent the message yet (no image with caption), send as text (if not empty)
+            if not text_message_sent and content.strip():
+                telegram_msg = await self.telegram_bot.send_message(
+                    chat_id=TOPICS_CHANNEL_ID,
+                    message_thread_id=topic_id,
+                    text=content,
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_to_message_id=reply_to_message_id
+                )
+
+                self._update_last_sender(topic_id, user_id)
+
+                # Store message mapping
+                message_doc = {
+                    "message_content": message.content,
+                    "discord_channel_id": message.author.id,
+                    "discord_message_id": message.id,
+                    "telegram_channel_id": TOPICS_CHANNEL_ID,
+                    "telegram_topic_id": topic_id,
+                    "telegram_message_id": telegram_msg.message_id,
+                    "direction": "discord_to_telegram",
+                    "timestamp": datetime.utcnow(),
+                    "is_reply": reply_to_message_id is not None,
+                    "reply_to_telegram_id": reply_to_message_id
+                }
+                messages_collection.insert_one(message_doc)
+
+            # Handle remaining attachments (skip first image if it was already sent with caption)
+            first_image_skipped = text_message_sent  # Skip first image if already sent as caption
             for attachment in message.attachments:
                 try:
+                    # Skip first image if it was already sent with caption
+                    if first_image_skipped and attachment.content_type and attachment.content_type.startswith("image/") and attachment.size <= MAX_ATTACHMENT_SIZE:
+                        first_image_skipped = False
+                        continue
+
                     if attachment.size > MAX_ATTACHMENT_SIZE:
                         # File too large to re-upload; send as a link
                         telegram_attachment = await self.telegram_bot.send_message(
                             chat_id=TOPICS_CHANNEL_ID,
                             message_thread_id=topic_id,
-                            text=f"📎 {attachment.filename} (from {user_display_name}): {attachment.url}"
+                            text=f"📎 {escape_markdown(attachment.filename)} (from {escape_markdown(user_display_name)}): {attachment.url}"
                         )
                     else:
                         # Download to BytesIO and re-upload
                         file_response = requests.get(attachment.url)
                         if file_response.status_code != 200:
                             logger.error(f"Failed to download attachment {attachment.filename}: HTTP {file_response.status_code}")
-                            raise RuntimeError(f"Download failed with status {file_response.status_code}")
+                            continue  # Skip this attachment instead of raising
                         file_bio = io.BytesIO(file_response.content)
                         file_bio.name = attachment.filename
                         if attachment.content_type and attachment.content_type.startswith("image/"):
@@ -406,14 +559,14 @@ class MessageBridge:
                                 chat_id=TOPICS_CHANNEL_ID,
                                 message_thread_id=topic_id,
                                 photo=file_bio,
-                                caption=f"Image from {user_display_name}"
+                                caption=f"Image from {escape_markdown(user_display_name)}"
                             )
                         else:
                             telegram_attachment = await self.telegram_bot.send_document(
                                 chat_id=TOPICS_CHANNEL_ID,
                                 message_thread_id=topic_id,
                                 document=file_bio,
-                                caption=f"File from {user_display_name}: {attachment.filename}"
+                                caption=f"File from {escape_markdown(user_display_name)}: {escape_markdown(attachment.filename)}"
                             )
 
                     # Store attachment mapping
@@ -470,7 +623,7 @@ class MessageBridge:
                 global_name = after.author.display_name  # Fallback for older discord.py versions
             user_display_name = global_name if (global_name and global_name != username) else after.author.display_name
             channel_name = after.channel.name
-            content = f"**{user_display_name}** (@{username}) *[edited]*:\n{after.content}"
+            content = f"**{escape_markdown(user_display_name)}** (@{escape_markdown(username)}) *[edited]*:\n{escape_markdown(after.content)}"
 
             # Edit the Telegram message
             await self.telegram_bot.edit_message_text(
@@ -517,7 +670,7 @@ class MessageBridge:
             except AttributeError:
                 global_name = after.author.display_name  # Fallback for older discord.py versions
             user_display_name = global_name if (global_name and global_name != username) else after.author.display_name
-            content = f"**{user_display_name}** (@{username}) *[edited]*:\n{after.content}"
+            content = f"**{escape_markdown(user_display_name)}** (@{escape_markdown(username)}) *[edited]*:\n{escape_markdown(after.content)}"
 
             # Edit the Telegram message
             await self.telegram_bot.edit_message_text(
@@ -1275,11 +1428,19 @@ async def on_presence_update(before, after):
     topic_id = mapping["telegram_topic_id"]
     username = mapping["discord_username"]
 
-    # Compare against the last status we notified (DB-stored), not Discord's in-memory before
-    # This ensures duplicate suppression survives bot restarts
+    # Check in-memory cache first to prevent rapid-fire duplicates from Discord's multiple presence_update events
+    if not bridge._should_send_status_update(after.id, after_text):
+        logger.debug(f"Skipping duplicate status update for {username}: same status sent recently")
+        return
+
+    # Also compare against the last status we notified (DB-stored) for cross-restart deduplication
     stored_status = mapping.get("custom_status")
     if after_text == stored_status:
+        bridge._record_status_sent(after.id, after_text)  # Still record it in memory even though it matches DB
         return
+
+    # Record status immediately to prevent race conditions from rapid Discord events
+    bridge._record_status_sent(after.id, after_text)
 
     if after_text:
         emoji_part = ""
@@ -1288,11 +1449,10 @@ async def on_presence_update(before, after):
             emoji = after_custom.emoji
             if emoji.is_unicode_emoji():
                 emoji_part = f"{emoji.name} "
-        # Escape Markdown special characters in user-provided status text
-        escaped_text = after_text.replace("\\", "\\\\").replace("_", "\\_").replace("*", "\\*").replace("`", "\\`").replace("[", "\\[")
-        status_msg = f"💬 **@{username}** set their status to: {emoji_part}{escaped_text}"
+        # Escape Markdown special characters in user-provided status text and username
+        status_msg = f"💬 **@{escape_markdown(username)}** set their status to: {emoji_part}{escape_markdown(after_text)}"
     else:
-        status_msg = f"💬 **@{username}** cleared their custom status"
+        status_msg = f"💬 **@{escape_markdown(username)}** cleared their custom status"
 
     status_message_id = mapping.get("status_message_id")
 
@@ -1580,6 +1740,11 @@ async def resetstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         {"_id": mapping["_id"]},
         {"$set": {"custom_status": None, "status_message_id": None}}
     )
+
+    # Also clear the in-memory status cache for this user
+    discord_user_id = mapping.get("discord_user_id")
+    if discord_user_id and discord_user_id in bridge._last_status_sent:
+        del bridge._last_status_sent[discord_user_id]
 
     await update.message.reply_text(
         "✅ Status reset. The next Discord status change will create a fresh pinned message.",
