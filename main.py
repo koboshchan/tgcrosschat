@@ -122,7 +122,21 @@ def initialize_database():
 
 # Initialize bots
 discord_client = discord.Client()
-telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+async def post_init(application):
+    """Register bot commands in the Telegram command palette after startup"""
+    from telegram import BotCommand
+    await application.bot.set_my_commands([
+        BotCommand("ping",         "Check if the bot is alive"),
+        BotCommand("data",         "Show current channel and topic IDs"),
+        BotCommand("connect",      "Link a Discord channel to this topic"),
+        BotCommand("unlink",       "Unlink the Discord channel from this topic"),
+        BotCommand("resetstatus",  "Clear the stored Discord status for this topic"),
+        BotCommand("header",       "Show raw Discord request headers (debug)"),
+    ])
+    logger.info("Bot commands registered")
+
+telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
 
 # Store Discord event loop for cross-thread calls
 discord_loop = None
@@ -1270,12 +1284,19 @@ async def on_presence_update(before, after):
     if after_text:
         emoji_part = ""
         if after_custom and after_custom.emoji:
-            emoji_part = f"{after_custom.emoji} "
-        status_msg = f"💬 **@{username}** set their status to: {emoji_part}{after_text}"
+            # Only use the emoji if it's a Unicode emoji; custom guild emojis render as <:name:id> in Telegram
+            emoji = after_custom.emoji
+            if emoji.is_unicode_emoji():
+                emoji_part = f"{emoji.name} "
+        # Escape Markdown special characters in user-provided status text
+        escaped_text = after_text.replace("\\", "\\\\").replace("_", "\\_").replace("*", "\\*").replace("`", "\\`").replace("[", "\\[")
+        status_msg = f"💬 **@{username}** set their status to: {emoji_part}{escaped_text}"
     else:
         status_msg = f"💬 **@{username}** cleared their custom status"
 
     status_message_id = mapping.get("status_message_id")
+
+    need_new_message = status_message_id is None
 
     if status_message_id is not None:
         # Edit the existing pinned status message
@@ -1288,11 +1309,22 @@ async def on_presence_update(before, after):
             )
             logger.debug(f"Edited pinned status message {status_message_id} for {username}")
         except Exception as e:
-            logger.error(f"Failed to edit status message for {username}: {e}")
-            return
-    else:
-        # No stored status message — clear any existing pinned messages in the topic first,
-        # then send a fresh status message and pin it
+            logger.error(f"Failed to edit status message for {username}: {e}. Will send a new message.")
+            # Message may have been deleted; fall through to create a fresh one
+            need_new_message = True
+            status_message_id = None
+
+    if need_new_message:
+        # Delete the old status message (if we know its ID) and unpin everything else
+        if status_message_id is not None:
+            try:
+                await bridge.telegram_bot.delete_message(
+                    chat_id=TOPICS_CHANNEL_ID,
+                    message_id=status_message_id
+                )
+                logger.debug(f"Deleted old status message {status_message_id} for {username}")
+            except Exception as e:
+                logger.debug(f"Could not delete old status message for {username} (may already be gone): {e}")
         try:
             await bridge.telegram_bot.unpin_all_forum_topic_messages(
                 chat_id=TOPICS_CHANNEL_ID,
@@ -1508,6 +1540,53 @@ async def header_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=ParseMode.MARKDOWN
     )
 
+async def resetstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /resetstatus command - clears custom_status and status_message_id for this topic's mapping"""
+    topic_id = update.message.message_thread_id
+    if not topic_id:
+        await update.message.reply_text(
+            "❌ This command must be run in a topic thread.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    # Check DM mapping first
+    mapping = mappings_collection.find_one({"telegram_topic_id": topic_id})
+    collection = mappings_collection
+    if not mapping:
+        mapping = channel_mappings_collection.find_one({"telegram_topic_id": topic_id})
+        collection = channel_mappings_collection
+
+    if not mapping:
+        await update.message.reply_text(
+            "❌ No mapping found for this topic.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    old_status_message_id = mapping.get("status_message_id")
+
+    # Delete the pinned status message if we know it
+    if old_status_message_id is not None:
+        try:
+            await update.get_bot().delete_message(
+                chat_id=TOPICS_CHANNEL_ID,
+                message_id=old_status_message_id
+            )
+        except Exception as e:
+            logger.debug(f"Could not delete status message during resetstatus: {e}")
+
+    collection.update_one(
+        {"_id": mapping["_id"]},
+        {"$set": {"custom_status": None, "status_message_id": None}}
+    )
+
+    await update.message.reply_text(
+        "✅ Status reset. The next Discord status change will create a fresh pinned message.",
+        parse_mode=ParseMode.MARKDOWN
+    )
+    logger.info(f"resetstatus executed for topic {topic_id}")
+
 def run_telegram_bot():
     """Run Telegram bot in main thread"""
     # Add ping command handler
@@ -1525,6 +1604,10 @@ def run_telegram_bot():
     # Add unlink command handler
     unlink_handler = CommandHandler("unlink", unlink_command)
     telegram_app.add_handler(unlink_handler)
+
+    # Add resetstatus command handler
+    resetstatus_handler = CommandHandler("resetstatus", resetstatus_command)
+    telegram_app.add_handler(resetstatus_handler)
 
     # Add header command handler for testing
     header_handler = CommandHandler("header", header_command)
